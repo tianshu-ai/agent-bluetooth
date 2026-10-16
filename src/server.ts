@@ -47,7 +47,7 @@ export function startServer(opts: ServerOpts) {
           orgId: msg.orgId, agentId: msg.agentId,
           displayName: msg.card?.name || msg.agentId,
           description: msg.card?.description || "",
-          cardJson: JSON.stringify(msg.card || {}),
+          cardJson: JSON.stringify({ ...(msg.card || {}), provider: msg.providerName || msg.card?.provider || "" }),
           apiKeyHash: "", discoverable: msg.discoverable ?? false,
         });
 
