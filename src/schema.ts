@@ -67,7 +67,7 @@ export function upsertAgent(
       description = excluded.description,
       card_json = excluded.card_json,
       api_key_hash = CASE WHEN excluded.api_key_hash != '' THEN excluded.api_key_hash ELSE agents.api_key_hash END,
-      discoverable = excluded.discoverable,
+      discoverable = agents.discoverable,
       online = 1,
       last_seen_at = excluded.last_seen_at,
       updated_at = excluded.updated_at

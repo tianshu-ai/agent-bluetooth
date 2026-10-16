@@ -50,10 +50,12 @@ export function startServer(opts: ServerOpts) {
           apiKeyHash: "", discoverable: msg.discoverable ?? false,
         });
 
+        const currentAgent = getAgent(db, msg.orgId, msg.agentId);
         ws.send(JSON.stringify({
           type: "registered",
           publicUrl: `${publicUrl}/u/${msg.orgId}/${msg.agentId}`,
           agentPath: `${msg.orgId}/${msg.agentId}`,
+          discoverable: currentAgent?.discoverable ?? false,
         }));
         console.log(`[bluetooth] agent registered: ${id} (discoverable: ${msg.discoverable ?? false})`);
       }
