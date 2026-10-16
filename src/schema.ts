@@ -19,6 +19,7 @@ export function openDb(path: string): Db {
       api_key_hash  TEXT NOT NULL DEFAULT '',
       discoverable  INTEGER NOT NULL DEFAULT 0,
       pair_token    TEXT NOT NULL DEFAULT '',
+      discoverable_until INTEGER NOT NULL DEFAULT 0,
       online        INTEGER NOT NULL DEFAULT 0,
       last_seen_at  INTEGER NOT NULL DEFAULT 0,
       created_at    INTEGER NOT NULL DEFAULT 0,
@@ -107,4 +108,13 @@ function rowToAgent(r: any): Agent {
     pairToken: r.pair_token || "",
     online: r.online === 1, lastSeenAt: r.last_seen_at,
   };
+}
+
+/** Clear discoverable + pair_token for agents whose discoverable_until has passed. */
+export function expireDiscoverable(db: Db) {
+  const now = Date.now();
+  const result = db.prepare(
+    "UPDATE agents SET discoverable = 0, pair_token = '', discoverable_until = 0 WHERE discoverable = 1 AND discoverable_until > 0 AND discoverable_until < ?"
+  ).run(now);
+  return (result as any).changes || 0;
 }

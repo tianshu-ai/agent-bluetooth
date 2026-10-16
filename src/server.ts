@@ -2,7 +2,7 @@
 
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { upsertAgent, setAgentOffline, setAgentOnline, listDiscoverableAgents, getAgent, type Db } from "./schema.js";
+import { upsertAgent, setAgentOffline, setAgentOnline, listDiscoverableAgents, getAgent, expireDiscoverable, type Db } from "./schema.js";
 
 interface AgentSession {
   ws: WebSocket;
@@ -78,7 +78,6 @@ export function startServer(opts: ServerOpts) {
           if (!targetAgent || !targetAgent.discoverable) {
             ws.send(JSON.stringify({ type: "pair_response", success: false, error: "not_discoverable" }));
           } else {
-            const targetPairToken = targetAgent.pairToken || "";
             const requestId = crypto.randomUUID();
             const pairPending = new Promise<any>((resolve_pair) => {
               const timer = setTimeout(() => { pending.delete(requestId); resolve_pair({ success: false, error: "timeout" }); }, 30000);
@@ -98,7 +97,7 @@ export function startServer(opts: ServerOpts) {
               ws.send(JSON.stringify({
                 type: "pair_response",
                 success: resp.success ?? false,
-                token: resp.success ? targetPairToken : undefined,
+                token: resp.token,  // B's long-lived comm token from pair_accept
                 name: resp.name,
                 card: resp.card,
                 endpoint: resp.success ? `${publicUrl}/u/${msg.targetOrgId}/${msg.targetAgentId}` : undefined,
@@ -119,14 +118,23 @@ export function startServer(opts: ServerOpts) {
       }
 
       if (msg.type === "set_discoverable" && session) {
-        db.prepare("UPDATE agents SET discoverable = ?, pair_token = ?, updated_at = ? WHERE id = ?").run(
+        // Parse JWT exp to set discoverable_until
+        let expiresAt = 0;
+        if (msg.discoverable && msg.pairToken) {
+          try {
+            const payload = JSON.parse(Buffer.from(msg.pairToken.split(".")[1], "base64url").toString());
+            if (payload.exp) expiresAt = payload.exp * 1000; // JWT exp is seconds
+          } catch { /* ignore parse errors */ }
+        }
+        db.prepare("UPDATE agents SET discoverable = ?, pair_token = ?, discoverable_until = ?, updated_at = ? WHERE id = ?").run(
           msg.discoverable ? 1 : 0,
           msg.discoverable ? (msg.pairToken || "") : "",
+          msg.discoverable ? expiresAt : 0,
           Date.now(),
           session.id,
         );
         ws.send(JSON.stringify({ type: "discoverable_updated", discoverable: !!msg.discoverable }));
-        console.log(`[bluetooth] ${session.id} discoverable=${!!msg.discoverable} pairToken=${msg.pairToken ? "yes" : "no"}`);
+        console.log(`[bluetooth] ${session.id} discoverable=${!!msg.discoverable} expiresAt=${expiresAt ? new Date(expiresAt).toISOString() : "none"}`);
       }
 
       if (msg.type === "ping") {
@@ -236,6 +244,13 @@ export function startServer(opts: ServerOpts) {
     console.log(`  📡 Discovery: ${publicUrl}/discovery`);
     console.log(`  ❤️  Health:    ${publicUrl}/healthz\n`);
   });
+
+  // Periodic cleanup: expire discoverable agents whose pair token has expired
+  const cleanupTimer = setInterval(() => {
+    const expired = expireDiscoverable(db);
+    if (expired > 0) console.log(`[bluetooth] expired ${expired} discoverable agent(s)`);
+  }, 30_000); // check every 30s
+  cleanupTimer.unref();
 
   return { httpServer, wss };
 }
