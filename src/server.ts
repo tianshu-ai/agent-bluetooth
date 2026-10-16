@@ -247,8 +247,22 @@ export function startServer(opts: ServerOpts) {
 
   // Periodic cleanup: expire discoverable agents whose pair token has expired
   const cleanupTimer = setInterval(() => {
-    const expired = expireDiscoverable(db);
-    if (expired > 0) console.log(`[bluetooth] expired ${expired} discoverable agent(s)`);
+    // Find about-to-expire agents first, so we can notify them
+    const now = Date.now();
+    const expiring = db.prepare(
+      "SELECT id FROM agents WHERE discoverable = 1 AND discoverable_until > 0 AND discoverable_until < ?"
+    ).all(now) as { id: string }[];
+    if (expiring.length > 0) {
+      const expired = expireDiscoverable(db);
+      console.log(`[bluetooth] expired ${expired} discoverable agent(s)`);
+      // Notify connected sessions
+      for (const row of expiring) {
+        const s = sessions.get(row.id);
+        if (s && s.ws.readyState === WebSocket.OPEN) {
+          s.ws.send(JSON.stringify({ type: "discoverable_expired" }));
+        }
+      }
+    }
   }, 30_000); // check every 30s
   cleanupTimer.unref();
 
