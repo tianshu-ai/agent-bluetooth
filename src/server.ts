@@ -21,10 +21,21 @@ export interface ServerOpts {
   db: Db;
   port: number;
   publicUrl: string;
+  adminKeys?: string[];
 }
 
 export function startServer(opts: ServerOpts) {
-  const { db, port, publicUrl } = opts;
+  const { db, port, publicUrl, adminKeys = [] } = opts;
+  const adminKeySet = new Set(adminKeys);
+
+  function requireAdmin(req: IncomingMessage, res: ServerResponse): boolean {
+    if (adminKeySet.size === 0) return true; // no keys configured = open
+    const auth = req.headers.authorization || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    if (token && adminKeySet.has(token)) return true;
+    json(res, 401, { error: "admin_key_required" });
+    return false;
+  }
   const sessions = new Map<string, AgentSession>();
   const pending = new Map<string, PendingRequest>();
 
@@ -276,12 +287,14 @@ export function startServer(opts: ServerOpts) {
       return;
     }
 
-    // ── Admin: Provider management ──
+    // ── Admin: Provider management (requires admin key) ──
     if (url === "/admin/providers" && method === "GET") {
+      if (!requireAdmin(req, res)) return;
       json(res, 200, { providers: listProviders(db) });
       return;
     }
     if (url === "/admin/providers" && method === "POST") {
+      if (!requireAdmin(req, res)) return;
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(chunk as Buffer);
       let body: any;
@@ -300,6 +313,7 @@ export function startServer(opts: ServerOpts) {
     }
     const providerDeleteMatch = url.match(/^\/admin\/providers\/([^/]+)$/);
     if (providerDeleteMatch && method === "DELETE") {
+      if (!requireAdmin(req, res)) return;
       const ok = deleteProvider(db, decodeURIComponent(providerDeleteMatch[1]));
       json(res, ok ? 200 : 404, ok ? { ok: true } : { error: "not_found" });
       return;
