@@ -73,32 +73,38 @@ export function startServer(opts: ServerOpts) {
         if (!targetSession || targetSession.ws.readyState !== WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "pair_response", success: false, error: "agent_offline" }));
         } else {
-          // Forward pair request to target, include requester info
-          const requestId = crypto.randomUUID();
-          const pairPending = new Promise<any>((resolve_pair) => {
-            const timer = setTimeout(() => { pending.delete(requestId); resolve_pair({ type: "pair_response", success: false, error: "timeout" }); }, 30000);
-            pending.set(requestId, { resolve: resolve_pair, timer });
-          });
-          targetSession.ws.send(JSON.stringify({
-            type: "pair_request",
-            requestId,
-            fromOrgId: session.orgId,
-            fromAgentId: session.agentId,
-            fromName: msg.name || session.displayName,
-            fromCard: msg.card,
-            fromToken: msg.token,
-            fromEndpoint: `${publicUrl}/u/${session.orgId}/${session.agentId}`,
-          }));
-          pairPending.then((resp: any) => {
-            ws.send(JSON.stringify({
-              type: "pair_response",
-              success: resp.success ?? false,
-              token: resp.token,
-              name: resp.name,
-              card: resp.card,
-              endpoint: resp.success ? `${publicUrl}/u/${msg.targetOrgId}/${msg.targetAgentId}` : undefined,
+          // Get target's pair token from DB
+          const targetAgent = getAgent(db, msg.targetOrgId, msg.targetAgentId);
+          if (!targetAgent || !targetAgent.discoverable) {
+            ws.send(JSON.stringify({ type: "pair_response", success: false, error: "not_discoverable" }));
+          } else {
+            const targetPairToken = targetAgent.pairToken || "";
+            const requestId = crypto.randomUUID();
+            const pairPending = new Promise<any>((resolve_pair) => {
+              const timer = setTimeout(() => { pending.delete(requestId); resolve_pair({ success: false, error: "timeout" }); }, 30000);
+              pending.set(requestId, { resolve: resolve_pair, timer });
+            });
+            targetSession.ws.send(JSON.stringify({
+              type: "pair_request",
+              requestId,
+              fromOrgId: session.orgId,
+              fromAgentId: session.agentId,
+              fromName: msg.name || session.displayName,
+              fromCard: msg.card,
+              fromToken: msg.token,
+              fromEndpoint: `${publicUrl}/u/${session.orgId}/${session.agentId}`,
             }));
-          });
+            pairPending.then((resp: any) => {
+              ws.send(JSON.stringify({
+                type: "pair_response",
+                success: resp.success ?? false,
+                token: resp.success ? targetPairToken : undefined,
+                name: resp.name,
+                card: resp.card,
+                endpoint: resp.success ? `${publicUrl}/u/${msg.targetOrgId}/${msg.targetAgentId}` : undefined,
+              }));
+            });
+          }
         }
       }
 
@@ -113,9 +119,14 @@ export function startServer(opts: ServerOpts) {
       }
 
       if (msg.type === "set_discoverable" && session) {
-        db.prepare("UPDATE agents SET discoverable = ?, updated_at = ? WHERE id = ?").run(msg.discoverable ? 1 : 0, Date.now(), session.id);
+        db.prepare("UPDATE agents SET discoverable = ?, pair_token = ?, updated_at = ? WHERE id = ?").run(
+          msg.discoverable ? 1 : 0,
+          msg.discoverable ? (msg.pairToken || "") : "",
+          Date.now(),
+          session.id,
+        );
         ws.send(JSON.stringify({ type: "discoverable_updated", discoverable: !!msg.discoverable }));
-        console.log(`[bluetooth] ${session.id} discoverable=${!!msg.discoverable}`);
+        console.log(`[bluetooth] ${session.id} discoverable=${!!msg.discoverable} pairToken=${msg.pairToken ? "yes" : "no"}`);
       }
 
       if (msg.type === "ping") {

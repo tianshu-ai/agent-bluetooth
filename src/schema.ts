@@ -18,6 +18,7 @@ export function openDb(path: string): Db {
       card_json     TEXT NOT NULL DEFAULT '{}',
       api_key_hash  TEXT NOT NULL DEFAULT '',
       discoverable  INTEGER NOT NULL DEFAULT 0,
+      pair_token    TEXT NOT NULL DEFAULT '',
       online        INTEGER NOT NULL DEFAULT 0,
       last_seen_at  INTEGER NOT NULL DEFAULT 0,
       created_at    INTEGER NOT NULL DEFAULT 0,
@@ -49,6 +50,7 @@ export interface Agent {
   description: string;
   cardJson: string;
   discoverable: boolean;
+  pairToken: string;
   online: boolean;
   lastSeenAt: number;
 }
@@ -75,7 +77,7 @@ export function upsertAgent(
 
   return {
     id, orgId: opts.orgId, agentId: opts.agentId, displayName: opts.displayName,
-    description: opts.description, cardJson: opts.cardJson, discoverable: opts.discoverable,
+    description: opts.description, cardJson: opts.cardJson, discoverable: opts.discoverable, pairToken: "",
     online: true, lastSeenAt: now,
   };
 }
@@ -102,6 +104,7 @@ function rowToAgent(r: any): Agent {
     id: r.id, orgId: r.org_id, agentId: r.agent_id,
     displayName: r.display_name, description: r.description,
     cardJson: r.card_json, discoverable: r.discoverable === 1,
+    pairToken: r.pair_token || "",
     online: r.online === 1, lastSeenAt: r.last_seen_at,
   };
 }
