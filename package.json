@@ -1,0 +1,30 @@
+{
+  "name": "@tianshu-ai/agent-bluetooth",
+  "version": "0.1.0",
+  "description": "Agent Bluetooth — A2A relay server for cross-network agent discovery and communication",
+  "type": "module",
+  "main": "dist/main.js",
+  "bin": {
+    "agent-bluetooth": "dist/main.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "better-sqlite3": "^11.7.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/ws": "^8.5.13",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tianshu-ai/agent-bluetooth.git"
+  }
+}
