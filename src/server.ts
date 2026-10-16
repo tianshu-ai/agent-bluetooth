@@ -66,23 +66,19 @@ export function startServer(opts: ServerOpts) {
         if (p) { clearTimeout(p.timer); pending.delete(msg.requestId); p.resolve({ status: msg.status || 200, headers: msg.headers || {}, body: msg.body || "" }); }
       }
 
-      // ── Pair request: A wants to pair with B ──
+      // ── Pair request: A wants to pair with B (async, no token) ──
       if (msg.type === "pair_request" && session && msg.targetOrgId && msg.targetAgentId) {
         const targetId = `${msg.targetOrgId}/${msg.targetAgentId}`;
         const targetSession = sessions.get(targetId);
         if (!targetSession || targetSession.ws.readyState !== WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "pair_response", success: false, error: "agent_offline" }));
         } else {
-          // Get target's pair token from DB
           const targetAgent = getAgent(db, msg.targetOrgId, msg.targetAgentId);
           if (!targetAgent || !targetAgent.discoverable) {
             ws.send(JSON.stringify({ type: "pair_response", success: false, error: "not_discoverable" }));
           } else {
-            const requestId = crypto.randomUUID();
-            const pairPending = new Promise<any>((resolve_pair) => {
-              const timer = setTimeout(() => { pending.delete(requestId); resolve_pair({ success: false, error: "timeout" }); }, 30000);
-              pending.set(requestId, { resolve: resolve_pair, timer });
-            });
+            const requestId = msg.requestId || crypto.randomUUID();
+            // Forward to target — no token, just identity info
             targetSession.ws.send(JSON.stringify({
               type: "pair_request",
               requestId,
@@ -90,32 +86,68 @@ export function startServer(opts: ServerOpts) {
               fromAgentId: session.agentId,
               fromName: msg.name || session.displayName,
               fromCard: msg.card,
-              fromToken: msg.token,
               fromEndpoint: `${publicUrl}/u/${session.orgId}/${session.agentId}`,
             }));
-            pairPending.then((resp: any) => {
-              ws.send(JSON.stringify({
-                type: "pair_response",
-                success: resp.success ?? false,
-                token: resp.token,  // B's long-lived comm token from pair_accept
-                name: resp.name,
-                card: resp.card,
-                endpoint: resp.success ? `${publicUrl}/u/${msg.targetOrgId}/${msg.targetAgentId}` : undefined,
-              }));
-            });
+            // Immediately ack to sender — request delivered, waiting for user confirmation
+            ws.send(JSON.stringify({ type: "pair_response", success: true, status: "pending", requestId }));
+            console.log(`[bluetooth] pair_request forwarded: ${session.id} -> ${targetId} (requestId=${requestId})`);
           }
         }
       }
 
-      // ── Pair accept: B responds to A's pair request ──
-      if (msg.type === "pair_accept" && msg.requestId) {
-        const p = pending.get(msg.requestId);
-        if (p) {
-          clearTimeout(p.timer);
-          pending.delete(msg.requestId);
-          p.resolve({ success: true, token: msg.token, name: msg.name, card: msg.card });
+      // ── Pair accept: B confirms pairing with A ──
+      if (msg.type === "pair_accept" && session && msg.targetOrgId && msg.targetAgentId) {
+        const targetId = `${msg.targetOrgId}/${msg.targetAgentId}`;
+        const targetSession = sessions.get(targetId);
+        if (targetSession && targetSession.ws.readyState === WebSocket.OPEN) {
+          targetSession.ws.send(JSON.stringify({
+            type: "pair_accepted",
+            requestId: msg.requestId,
+            fromOrgId: session.orgId,
+            fromAgentId: session.agentId,
+            fromName: msg.name,
+            fromCard: msg.card,
+            fromToken: msg.token,  // B's comm token for A to use
+            fromEndpoint: `${publicUrl}/u/${session.orgId}/${session.agentId}`,
+          }));
+          console.log(`[bluetooth] pair_accept: ${session.id} -> ${targetId}`);
         }
       }
+
+      // ── Pair reject: B rejects A's request ──
+      if (msg.type === "pair_reject" && session && msg.targetOrgId && msg.targetAgentId) {
+        const targetId = `${msg.targetOrgId}/${msg.targetAgentId}`;
+        const targetSession = sessions.get(targetId);
+        if (targetSession && targetSession.ws.readyState === WebSocket.OPEN) {
+          targetSession.ws.send(JSON.stringify({
+            type: "pair_rejected",
+            requestId: msg.requestId,
+            fromOrgId: session.orgId,
+            fromAgentId: session.agentId,
+          }));
+          console.log(`[bluetooth] pair_reject: ${session.id} -> ${targetId}`);
+        }
+      }
+
+      // ── Pair complete: A sends back its comm token after receiving B's ──
+      if (msg.type === "pair_complete" && session && msg.targetOrgId && msg.targetAgentId) {
+        const targetId = `${msg.targetOrgId}/${msg.targetAgentId}`;
+        const targetSession = sessions.get(targetId);
+        if (targetSession && targetSession.ws.readyState === WebSocket.OPEN) {
+          targetSession.ws.send(JSON.stringify({
+            type: "pair_completed",
+            requestId: msg.requestId,
+            fromOrgId: session.orgId,
+            fromAgentId: session.agentId,
+            fromName: msg.name,
+            fromCard: msg.card,
+            fromToken: msg.token,  // A's comm token for B to use
+            fromEndpoint: `${publicUrl}/u/${session.orgId}/${session.agentId}`,
+          }));
+          console.log(`[bluetooth] pair_complete: ${session.id} -> ${targetId}`);
+        }
+      }
+
 
       if (msg.type === "set_discoverable" && session) {
         // Parse JWT exp to set discoverable_until
