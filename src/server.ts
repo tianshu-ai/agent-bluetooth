@@ -63,6 +63,12 @@ export function startServer(opts: ServerOpts) {
         if (p) { clearTimeout(p.timer); pending.delete(msg.requestId); p.resolve({ status: msg.status || 200, headers: msg.headers || {}, body: msg.body || "" }); }
       }
 
+      if (msg.type === "set_discoverable" && session) {
+        db.prepare("UPDATE agents SET discoverable = ?, updated_at = ? WHERE id = ?").run(msg.discoverable ? 1 : 0, Date.now(), session.id);
+        ws.send(JSON.stringify({ type: "discoverable_updated", discoverable: !!msg.discoverable }));
+        console.log(`[bluetooth] ${session.id} discoverable=${!!msg.discoverable}`);
+      }
+
       if (msg.type === "ping") {
         ws.send('{"type":"pong"}');
         if (session) setAgentOnline(db, session.id);
