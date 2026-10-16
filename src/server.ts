@@ -9,10 +9,11 @@ interface AgentSession {
   orgId: string;
   agentId: string;
   id: string;
+  displayName: string;
 }
 
 interface PendingRequest {
-  resolve: (data: { status: number; headers: Record<string, string>; body: string }) => void;
+  resolve: (data: any) => void;
   timer: ReturnType<typeof setTimeout>;
 }
 
@@ -39,7 +40,7 @@ export function startServer(opts: ServerOpts) {
 
       if (msg.type === "register" && msg.orgId && msg.agentId) {
         const id = `${msg.orgId}/${msg.agentId}`;
-        session = { ws, orgId: msg.orgId, agentId: msg.agentId, id };
+        session = { ws, orgId: msg.orgId, agentId: msg.agentId, id, displayName: msg.card?.name || msg.agentId };
         sessions.set(id, session);
 
         upsertAgent(db, {
@@ -63,6 +64,52 @@ export function startServer(opts: ServerOpts) {
       if (msg.type === "response" && msg.requestId) {
         const p = pending.get(msg.requestId);
         if (p) { clearTimeout(p.timer); pending.delete(msg.requestId); p.resolve({ status: msg.status || 200, headers: msg.headers || {}, body: msg.body || "" }); }
+      }
+
+      // ── Pair request: A wants to pair with B ──
+      if (msg.type === "pair_request" && session && msg.targetOrgId && msg.targetAgentId) {
+        const targetId = `${msg.targetOrgId}/${msg.targetAgentId}`;
+        const targetSession = sessions.get(targetId);
+        if (!targetSession || targetSession.ws.readyState !== WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "pair_response", success: false, error: "agent_offline" }));
+        } else {
+          // Forward pair request to target, include requester info
+          const requestId = crypto.randomUUID();
+          const pairPending = new Promise<any>((resolve_pair) => {
+            const timer = setTimeout(() => { pending.delete(requestId); resolve_pair({ type: "pair_response", success: false, error: "timeout" }); }, 30000);
+            pending.set(requestId, { resolve: resolve_pair, timer });
+          });
+          targetSession.ws.send(JSON.stringify({
+            type: "pair_request",
+            requestId,
+            fromOrgId: session.orgId,
+            fromAgentId: session.agentId,
+            fromName: msg.name || session.displayName,
+            fromCard: msg.card,
+            fromToken: msg.token,
+            fromEndpoint: `${publicUrl}/u/${session.orgId}/${session.agentId}`,
+          }));
+          pairPending.then((resp: any) => {
+            ws.send(JSON.stringify({
+              type: "pair_response",
+              success: resp.success ?? false,
+              token: resp.token,
+              name: resp.name,
+              card: resp.card,
+              endpoint: resp.success ? `${publicUrl}/u/${msg.targetOrgId}/${msg.targetAgentId}` : undefined,
+            }));
+          });
+        }
+      }
+
+      // ── Pair accept: B responds to A's pair request ──
+      if (msg.type === "pair_accept" && msg.requestId) {
+        const p = pending.get(msg.requestId);
+        if (p) {
+          clearTimeout(p.timer);
+          pending.delete(msg.requestId);
+          p.resolve({ success: true, token: msg.token, name: msg.name, card: msg.card });
+        }
       }
 
       if (msg.type === "set_discoverable" && session) {
