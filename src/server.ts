@@ -2,7 +2,7 @@
 
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { upsertAgent, setAgentOffline, setAgentOnline, listDiscoverableAgents, getAgent, expireDiscoverable, type Db } from "./schema.js";
+import { upsertAgent, setAgentOffline, setAgentOnline, listDiscoverableAgents, getAgent, expireDiscoverable, createProvider, listProviders, deleteProvider, validateToken, type Db } from "./schema.js";
 
 interface AgentSession {
   ws: WebSocket;
@@ -38,27 +38,52 @@ export function startServer(opts: ServerOpts) {
       let msg: any;
       try { msg = JSON.parse(String(raw)); } catch { return; }
 
-      if (msg.type === "register" && msg.orgId && msg.agentId) {
-        const id = `${msg.orgId}/${msg.agentId}`;
-        session = { ws, orgId: msg.orgId, agentId: msg.agentId, id, displayName: msg.card?.name || msg.agentId };
+      if (msg.type === "register") {
+        // Token-based auth: validate token to get provider identity
+        let orgId = msg.orgId || "";
+        let providerRef = "";
+        let providerName = "";
+        let providerId = "";
+        if (msg.token) {
+          const provider = validateToken(db, msg.token);
+          if (!provider) {
+            ws.send(JSON.stringify({ type: "error", error: "invalid_token" }));
+            ws.close();
+            return;
+          }
+          // Use providerId as orgId — server-authoritative identity
+          orgId = provider.providerId;
+          providerRef = provider.id;
+          providerName = provider.providerName;
+          providerId = provider.providerId;
+        }
+        if (!orgId || !msg.agentId) {
+          ws.send(JSON.stringify({ type: "error", error: "orgId and agentId required (use token or orgId)" }));
+          return;
+        }
+        const id = `${orgId}/${msg.agentId}`;
+        session = { ws, orgId, agentId: msg.agentId, id, displayName: msg.card?.name || msg.agentId };
         sessions.set(id, session);
 
         upsertAgent(db, {
-          orgId: msg.orgId, agentId: msg.agentId,
+          orgId, agentId: msg.agentId, providerRef,
           displayName: msg.card?.name || msg.agentId,
           description: msg.card?.description || "",
-          cardJson: JSON.stringify({ ...(msg.card || {}), provider: msg.providerName || msg.card?.provider || "", providerId: msg.providerId || "" }),
+          cardJson: JSON.stringify({ ...(msg.card || {}), provider: providerName, providerId }),
           apiKeyHash: "", discoverable: msg.discoverable ?? false,
         });
 
-        const currentAgent = getAgent(db, msg.orgId, msg.agentId);
+        const currentAgent = getAgent(db, orgId, msg.agentId);
         ws.send(JSON.stringify({
           type: "registered",
-          publicUrl: `${publicUrl}/u/${msg.orgId}/${msg.agentId}`,
-          agentPath: `${msg.orgId}/${msg.agentId}`,
+          publicUrl: `${publicUrl}/u/${orgId}/${msg.agentId}`,
+          agentPath: `${orgId}/${msg.agentId}`,
+          orgId,
+          providerId,
+          providerName,
           discoverable: currentAgent?.discoverable ?? false,
         }));
-        console.log(`[bluetooth] agent registered: ${id} (discoverable: ${msg.discoverable ?? false})`);
+        console.log(`[bluetooth] agent registered: ${id} (provider=${providerId || 'none'}, discoverable: ${msg.discoverable ?? false})`);
       }
 
       if (msg.type === "response" && msg.requestId) {
@@ -248,6 +273,35 @@ export function startServer(opts: ServerOpts) {
       for (const [k, v] of Object.entries(resp.headers)) res.setHeader(k, v);
       res.writeHead(resp.status, { "Content-Type": resp.headers["content-type"] || "application/json" });
       res.end(resp.body);
+      return;
+    }
+
+    // ── Admin: Provider management ──
+    if (url === "/admin/providers" && method === "GET") {
+      json(res, 200, { providers: listProviders(db) });
+      return;
+    }
+    if (url === "/admin/providers" && method === "POST") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk as Buffer);
+      let body: any;
+      try { body = JSON.parse(Buffer.concat(chunks).toString()); } catch { json(res, 400, { error: "invalid_json" }); return; }
+      const { providerId, providerName } = body;
+      if (!providerId) { json(res, 400, { error: "providerId required" }); return; }
+      try {
+        const result = createProvider(db, providerId, providerName || providerId);
+        console.log(`[bluetooth] provider created: ${providerId}`);
+        json(res, 201, { ok: true, provider: result.provider, token: result.token });
+      } catch (err: any) {
+        if (err.message?.includes("UNIQUE")) json(res, 409, { error: "providerId already exists" });
+        else json(res, 500, { error: String(err) });
+      }
+      return;
+    }
+    const providerDeleteMatch = url.match(/^\/admin\/providers\/([^/]+)$/);
+    if (providerDeleteMatch && method === "DELETE") {
+      const ok = deleteProvider(db, decodeURIComponent(providerDeleteMatch[1]));
+      json(res, ok ? 200 : 404, ok ? { ok: true } : { error: "not_found" });
       return;
     }
 

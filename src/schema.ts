@@ -9,10 +9,20 @@ export function openDb(path: string): Db {
   const db = new Database(path);
   db.pragma("journal_mode = WAL");
   db.exec(`
+    CREATE TABLE IF NOT EXISTS providers (
+      id              TEXT PRIMARY KEY,
+      provider_id     TEXT NOT NULL UNIQUE,
+      provider_name   TEXT NOT NULL DEFAULT '',
+      api_token_hash  TEXT NOT NULL,
+      created_at      INTEGER NOT NULL DEFAULT 0,
+      updated_at      INTEGER NOT NULL DEFAULT 0
+    );
+
     CREATE TABLE IF NOT EXISTS agents (
       id            TEXT PRIMARY KEY,
       org_id        TEXT NOT NULL,
       agent_id      TEXT NOT NULL,
+      provider_ref  TEXT NOT NULL DEFAULT '',
       display_name  TEXT NOT NULL DEFAULT '',
       description   TEXT NOT NULL DEFAULT '',
       card_json     TEXT NOT NULL DEFAULT '{}',
@@ -28,10 +38,22 @@ export function openDb(path: string): Db {
     );
     CREATE INDEX IF NOT EXISTS idx_agents_discoverable ON agents(discoverable, online);
   `);
+  // Migration: add provider_ref column if missing
+  try { db.exec("ALTER TABLE agents ADD COLUMN provider_ref TEXT NOT NULL DEFAULT ''"); } catch { /* already exists */ }
   return db;
 }
 
-// ── API key helpers ──
+// ── Token helpers ──
+
+export function generateToken(): string {
+  return "bt_" + randomBytes(32).toString("base64url");
+}
+
+export function hashToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+// ── API key helpers (legacy) ──
 
 export function generateApiKey(): string {
   return "sk_bt_" + randomBytes(24).toString("base64url");
@@ -41,12 +63,50 @@ export function hashApiKey(key: string): string {
   return createHash("sha256").update(key).digest("hex");
 }
 
+// ── Provider CRUD ──
+
+export interface Provider {
+  id: string;
+  providerId: string;
+  providerName: string;
+  createdAt: number;
+}
+
+export function createProvider(db: Db, providerId: string, providerName: string): { provider: Provider; token: string } {
+  const id = "prov_" + randomBytes(8).toString("hex");
+  const token = generateToken();
+  const now = Date.now();
+  db.prepare(
+    "INSERT INTO providers (id, provider_id, provider_name, api_token_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
+  ).run(id, providerId, providerName, hashToken(token), now, now);
+  return { provider: { id, providerId, providerName, createdAt: now }, token };
+}
+
+export function listProviders(db: Db): Provider[] {
+  return (db.prepare("SELECT * FROM providers ORDER BY created_at DESC").all() as any[]).map(r => ({
+    id: r.id, providerId: r.provider_id, providerName: r.provider_name, createdAt: r.created_at,
+  }));
+}
+
+export function deleteProvider(db: Db, providerId: string): boolean {
+  const result = db.prepare("DELETE FROM providers WHERE provider_id = ?").run(providerId);
+  return (result as any).changes > 0;
+}
+
+export function validateToken(db: Db, token: string): Provider | null {
+  const hash = hashToken(token);
+  const row = db.prepare("SELECT * FROM providers WHERE api_token_hash = ?").get(hash) as any;
+  if (!row) return null;
+  return { id: row.id, providerId: row.provider_id, providerName: row.provider_name, createdAt: row.created_at };
+}
+
 // ── Agent CRUD ──
 
 export interface Agent {
   id: string;
   orgId: string;
   agentId: string;
+  providerRef: string;
   displayName: string;
   description: string;
   cardJson: string;
@@ -58,14 +118,15 @@ export interface Agent {
 
 export function upsertAgent(
   db: Db,
-  opts: { orgId: string; agentId: string; displayName: string; description: string; cardJson: string; apiKeyHash: string; discoverable: boolean },
+  opts: { orgId: string; agentId: string; providerRef: string; displayName: string; description: string; cardJson: string; apiKeyHash: string; discoverable: boolean },
 ): Agent {
   const id = `${opts.orgId}/${opts.agentId}`;
   const now = Date.now();
   db.prepare(`
-    INSERT INTO agents (id, org_id, agent_id, display_name, description, card_json, api_key_hash, discoverable, online, last_seen_at, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+    INSERT INTO agents (id, org_id, agent_id, provider_ref, display_name, description, card_json, api_key_hash, discoverable, online, last_seen_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
+      provider_ref = excluded.provider_ref,
       display_name = excluded.display_name,
       description = excluded.description,
       card_json = excluded.card_json,
@@ -74,12 +135,12 @@ export function upsertAgent(
       online = 1,
       last_seen_at = excluded.last_seen_at,
       updated_at = excluded.updated_at
-  `).run(id, opts.orgId, opts.agentId, opts.displayName, opts.description, opts.cardJson, opts.apiKeyHash, opts.discoverable ? 1 : 0, now, now, now);
+  `).run(id, opts.orgId, opts.agentId, opts.providerRef, opts.displayName, opts.description, opts.cardJson, opts.apiKeyHash, opts.discoverable ? 1 : 0, now, now, now);
 
   return {
-    id, orgId: opts.orgId, agentId: opts.agentId, displayName: opts.displayName,
-    description: opts.description, cardJson: opts.cardJson, discoverable: opts.discoverable, pairToken: "",
-    online: true, lastSeenAt: now,
+    id, orgId: opts.orgId, agentId: opts.agentId, providerRef: opts.providerRef,
+    displayName: opts.displayName, description: opts.description, cardJson: opts.cardJson,
+    discoverable: opts.discoverable, pairToken: "", online: true, lastSeenAt: now,
   };
 }
 
@@ -103,6 +164,7 @@ export function getAgent(db: Db, orgId: string, agentId: string): Agent | null {
 function rowToAgent(r: any): Agent {
   return {
     id: r.id, orgId: r.org_id, agentId: r.agent_id,
+    providerRef: r.provider_ref || "",
     displayName: r.display_name, description: r.description,
     cardJson: r.card_json, discoverable: r.discoverable === 1,
     pairToken: r.pair_token || "",
