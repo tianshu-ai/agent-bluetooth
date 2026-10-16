@@ -111,7 +111,7 @@ export function startServer(opts: ServerOpts) {
               fromAgentId: session.agentId,
               fromName: msg.name || session.displayName,
               fromCard: msg.card,
-              fromEndpoint: `${publicUrl}/u/${session.orgId}/${session.agentId}`,
+              fromEndpoint: msg.userId ? `${publicUrl}/u/${session.orgId}/${session.agentId}/${msg.userId}` : `${publicUrl}/u/${session.orgId}/${session.agentId}`,
             }));
             // Immediately ack to sender — request delivered, waiting for user confirmation
             ws.send(JSON.stringify({ type: "pair_response", success: true, status: "pending", requestId }));
