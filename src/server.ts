@@ -10,6 +10,8 @@ interface AgentSession {
   agentId: string;
   id: string;
   displayName: string;
+  description: string;
+  cardJson: string;
 }
 
 interface PendingRequest {
@@ -73,7 +75,7 @@ export function startServer(opts: ServerOpts) {
           return;
         }
         const id = `${orgId}/${msg.agentId}`;
-        session = { ws, orgId, agentId: msg.agentId, id, displayName: msg.card?.name || msg.agentId };
+        session = { ws, orgId, agentId: msg.agentId, id, displayName: msg.card?.name || msg.agentId, description: msg.card?.description || "", cardJson: JSON.stringify(msg.card || {}) };
         sessions.set(id, session);
 
         upsertAgent(db, {
@@ -203,6 +205,22 @@ export function startServer(opts: ServerOpts) {
         );
         ws.send(JSON.stringify({ type: "discoverable_updated", discoverable: !!msg.discoverable }));
         console.log(`[bluetooth] ${session.id} discoverable=${!!msg.discoverable} expiresAt=${expiresAt ? new Date(expiresAt).toISOString() : "none"}`);
+      }
+
+      if (msg.type === "update_card" && session) {
+        const card = msg.card || {};
+        db.prepare("UPDATE agents SET display_name = ?, description = ?, card_json = ?, updated_at = ? WHERE id = ?").run(
+          card.name || session.displayName,
+          card.description || "",
+          JSON.stringify(card),
+          Date.now(),
+          session.id,
+        );
+        session.displayName = card.name || session.displayName;
+        session.description = card.description || "";
+        session.cardJson = JSON.stringify(card);
+        ws.send(JSON.stringify({ type: "card_updated" }));
+        console.log(`[bluetooth] ${session.id} card updated: ${card.name}`);
       }
 
       if (msg.type === "ping") {
