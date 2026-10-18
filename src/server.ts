@@ -9,10 +9,20 @@ interface AgentSession {
   orgId: string;
   agentId: string;
   userId: string;
-  id: string;  // canonical: orgId/agentId or orgId/agentId:userId
+  id: string;
   displayName: string;
   description: string;
   cardJson: string;
+}
+
+/** Per-WS connection state: one connection can register multiple agents */
+interface WsConnection {
+  ws: WebSocket;
+  orgId: string;
+  providerId: string;
+  providerRef: string;
+  providerName: string;
+  agents: Map<string, AgentSession>;  // id -> session
 }
 
 interface PendingRequest {
@@ -40,6 +50,7 @@ export function startServer(opts: ServerOpts) {
     return false;
   }
 
+  // Global agent session lookup (agent id -> session)
   const sessions = new Map<string, AgentSession>();
   const pending = new Map<string, PendingRequest>();
 
@@ -47,18 +58,20 @@ export function startServer(opts: ServerOpts) {
   const wss = new WebSocketServer({ server: httpServer });
 
   wss.on("connection", (ws) => {
-    let session: AgentSession | null = null;
+    const conn: WsConnection = { ws, orgId: "", providerId: "", providerRef: "", providerName: "", agents: new Map() };
 
     ws.on("message", (raw) => {
       let msg: any;
       try { msg = JSON.parse(String(raw)); } catch { return; }
 
       if (msg.type === "register") {
-        let orgId = msg.orgId || "";
-        let providerRef = "";
-        let providerName = "";
-        let providerId = "";
-        if (msg.token) {
+        let orgId = conn.orgId;
+        let providerRef = conn.providerRef;
+        let providerName = conn.providerName;
+        let providerId = conn.providerId;
+
+        // First register on this connection: authenticate
+        if (!orgId && msg.token) {
           const provider = validateToken(db, msg.token);
           if (!provider) {
             ws.send(JSON.stringify({ type: "error", error: "invalid_token" }));
@@ -69,7 +82,15 @@ export function startServer(opts: ServerOpts) {
           providerRef = provider.id;
           providerName = provider.providerName;
           providerId = provider.providerId;
+          conn.orgId = orgId;
+          conn.providerRef = providerRef;
+          conn.providerName = providerName;
+          conn.providerId = providerId;
+        } else if (!orgId && msg.orgId) {
+          orgId = msg.orgId;
+          conn.orgId = orgId;
         }
+
         if (!orgId || !msg.agentId) {
           ws.send(JSON.stringify({ type: "error", error: "orgId and agentId required (use token or orgId)" }));
           return;
@@ -77,12 +98,15 @@ export function startServer(opts: ServerOpts) {
 
         const userId = msg.userId || "";
         const id = buildAgentId(orgId, msg.agentId, userId || undefined);
-        session = {
+        const session: AgentSession = {
           ws, orgId, agentId: msg.agentId, userId, id,
           displayName: msg.card?.name || msg.agentId,
           description: msg.card?.description || "",
           cardJson: JSON.stringify(msg.card || {}),
         };
+
+        // Track in both connection-local and global maps
+        conn.agents.set(id, session);
         sessions.set(id, session);
 
         upsertAgent(db, {
@@ -98,14 +122,29 @@ export function startServer(opts: ServerOpts) {
         ws.send(JSON.stringify({
           type: "registered",
           publicUrl: `${publicUrl}${agentPath}`,
-          agentPath: agentPath.slice(3), // strip /u/
+          agentPath: agentPath.slice(3),
           orgId,
           providerId,
           providerName,
           userId,
+          agentId: msg.agentId,
           discoverable: currentAgent?.discoverable ?? false,
         }));
-        console.log(`[bluetooth] agent registered: ${id} (provider=${providerId || 'none'}, userId=${userId || 'none'}, discoverable: ${msg.discoverable ?? false})`);
+        console.log(`[bluetooth] agent registered: ${id} (provider=${providerId || 'none'}, userId=${userId || 'none'}, discoverable: ${msg.discoverable ?? false}) [${conn.agents.size} on this ws]`);
+      }
+
+      // ── Unregister a single agent from this connection ──
+      if (msg.type === "unregister" && msg.agentId) {
+        const userId = msg.userId || "";
+        const id = buildAgentId(conn.orgId, msg.agentId, userId || undefined);
+        const session = conn.agents.get(id);
+        if (session) {
+          conn.agents.delete(id);
+          sessions.delete(id);
+          setAgentOffline(db, id);
+          ws.send(JSON.stringify({ type: "unregistered", agentId: msg.agentId, userId }));
+          console.log(`[bluetooth] agent unregistered: ${id}`);
+        }
       }
 
       if (msg.type === "response" && msg.requestId) {
@@ -113,8 +152,24 @@ export function startServer(opts: ServerOpts) {
         if (p) { clearTimeout(p.timer); pending.delete(msg.requestId); p.resolve({ status: msg.status || 200, headers: msg.headers || {}, body: msg.body || "" }); }
       }
 
+      // ── Resolve the "from" session for pairing messages ──
+      // For multi-agent connections, use msg.fromUserId/msg.fromAgentId to find the right session
+      function resolveFromSession(): AgentSession | null {
+        if (conn.agents.size === 1) return conn.agents.values().next().value!;
+        // Try to find by explicit fields
+        const fromAgentId = msg.fromAgentId || msg.agentId;
+        const fromUserId = msg.fromUserId || msg.userId || "";
+        if (fromAgentId) {
+          const id = buildAgentId(conn.orgId, fromAgentId, fromUserId || undefined);
+          return conn.agents.get(id) || null;
+        }
+        return conn.agents.values().next().value || null;
+      }
+
       // ── Pair request: A wants to pair with B ──
-      if (msg.type === "pair_request" && session && msg.targetOrgId && msg.targetAgentId) {
+      if (msg.type === "pair_request" && msg.targetOrgId && msg.targetAgentId) {
+        const fromSession = resolveFromSession();
+        if (!fromSession) return;
         const targetUserId = msg.targetUserId || "";
         const targetId = buildAgentId(msg.targetOrgId, msg.targetAgentId, targetUserId || undefined);
         const targetSession = sessions.get(targetId);
@@ -126,47 +181,51 @@ export function startServer(opts: ServerOpts) {
             ws.send(JSON.stringify({ type: "pair_response", success: false, error: "not_discoverable" }));
           } else {
             const requestId = msg.requestId || crypto.randomUUID();
-            const fromPath = buildAgentPath(session.orgId, session.agentId, session.userId || undefined);
+            const fromPath = buildAgentPath(fromSession.orgId, fromSession.agentId, fromSession.userId || undefined);
             targetSession.ws.send(JSON.stringify({
               type: "pair_request",
               requestId,
-              fromOrgId: session.orgId,
-              fromAgentId: session.agentId,
-              fromUserId: session.userId,
-              fromName: msg.name || session.displayName,
+              fromOrgId: fromSession.orgId,
+              fromAgentId: fromSession.agentId,
+              fromUserId: fromSession.userId,
+              fromName: msg.name || fromSession.displayName,
               fromCard: msg.card,
               fromEndpoint: `${publicUrl}${fromPath}`,
             }));
             ws.send(JSON.stringify({ type: "pair_response", success: true, status: "pending", requestId }));
-            console.log(`[bluetooth] pair_request forwarded: ${session.id} -> ${targetId} (requestId=${requestId})`);
+            console.log(`[bluetooth] pair_request forwarded: ${fromSession.id} -> ${targetId} (requestId=${requestId})`);
           }
         }
       }
 
-      // ── Pair accept: B confirms pairing with A ──
-      if (msg.type === "pair_accept" && session && msg.targetOrgId && msg.targetAgentId) {
+      // ── Pair accept ──
+      if (msg.type === "pair_accept" && msg.targetOrgId && msg.targetAgentId) {
+        const fromSession = resolveFromSession();
+        if (!fromSession) return;
         const targetUserId = msg.targetUserId || "";
         const targetId = buildAgentId(msg.targetOrgId, msg.targetAgentId, targetUserId || undefined);
         const targetSession = sessions.get(targetId);
         if (targetSession && targetSession.ws.readyState === WebSocket.OPEN) {
-          const fromPath = buildAgentPath(session.orgId, session.agentId, session.userId || undefined);
+          const fromPath = buildAgentPath(fromSession.orgId, fromSession.agentId, fromSession.userId || undefined);
           targetSession.ws.send(JSON.stringify({
             type: "pair_accepted",
             requestId: msg.requestId,
-            fromOrgId: session.orgId,
-            fromAgentId: session.agentId,
-            fromUserId: session.userId,
+            fromOrgId: fromSession.orgId,
+            fromAgentId: fromSession.agentId,
+            fromUserId: fromSession.userId,
             fromName: msg.name,
             fromCard: msg.card,
             fromToken: msg.token,
             fromEndpoint: `${publicUrl}${fromPath}`,
           }));
-          console.log(`[bluetooth] pair_accept: ${session.id} -> ${targetId}`);
+          console.log(`[bluetooth] pair_accept: ${fromSession.id} -> ${targetId}`);
         }
       }
 
       // ── Pair reject ──
-      if (msg.type === "pair_reject" && session && msg.targetOrgId && msg.targetAgentId) {
+      if (msg.type === "pair_reject" && msg.targetOrgId && msg.targetAgentId) {
+        const fromSession = resolveFromSession();
+        if (!fromSession) return;
         const targetUserId = msg.targetUserId || "";
         const targetId = buildAgentId(msg.targetOrgId, msg.targetAgentId, targetUserId || undefined);
         const targetSession = sessions.get(targetId);
@@ -174,37 +233,50 @@ export function startServer(opts: ServerOpts) {
           targetSession.ws.send(JSON.stringify({
             type: "pair_rejected",
             requestId: msg.requestId,
-            fromOrgId: session.orgId,
-            fromAgentId: session.agentId,
-            fromUserId: session.userId,
+            fromOrgId: fromSession.orgId,
+            fromAgentId: fromSession.agentId,
+            fromUserId: fromSession.userId,
           }));
-          console.log(`[bluetooth] pair_reject: ${session.id} -> ${targetId}`);
+          console.log(`[bluetooth] pair_reject: ${fromSession.id} -> ${targetId}`);
         }
       }
 
-      // ── Pair complete: A sends back its comm token after receiving B's ──
-      if (msg.type === "pair_complete" && session && msg.targetOrgId && msg.targetAgentId) {
+      // ── Pair complete ──
+      if (msg.type === "pair_complete" && msg.targetOrgId && msg.targetAgentId) {
+        const fromSession = resolveFromSession();
+        if (!fromSession) return;
         const targetUserId = msg.targetUserId || "";
         const targetId = buildAgentId(msg.targetOrgId, msg.targetAgentId, targetUserId || undefined);
         const targetSession = sessions.get(targetId);
         if (targetSession && targetSession.ws.readyState === WebSocket.OPEN) {
-          const fromPath = buildAgentPath(session.orgId, session.agentId, session.userId || undefined);
+          const fromPath = buildAgentPath(fromSession.orgId, fromSession.agentId, fromSession.userId || undefined);
           targetSession.ws.send(JSON.stringify({
             type: "pair_completed",
             requestId: msg.requestId,
-            fromOrgId: session.orgId,
-            fromAgentId: session.agentId,
-            fromUserId: session.userId,
+            fromOrgId: fromSession.orgId,
+            fromAgentId: fromSession.agentId,
+            fromUserId: fromSession.userId,
             fromName: msg.name,
             fromCard: msg.card,
             fromToken: msg.token,
             fromEndpoint: `${publicUrl}${fromPath}`,
           }));
-          console.log(`[bluetooth] pair_complete: ${session.id} -> ${targetId}`);
+          console.log(`[bluetooth] pair_complete: ${fromSession.id} -> ${targetId}`);
         }
       }
 
-      if (msg.type === "set_discoverable" && session) {
+      if (msg.type === "set_discoverable") {
+        // Resolve which agent to set discoverable
+        const agentId = msg.agentId;
+        const userId = msg.userId || "";
+        let targetId: string | undefined;
+        if (agentId) {
+          targetId = buildAgentId(conn.orgId, agentId, userId || undefined);
+        } else if (conn.agents.size === 1) {
+          targetId = conn.agents.keys().next().value;
+        }
+        if (!targetId || !conn.agents.has(targetId)) return;
+
         let expiresAt = 0;
         if (msg.discoverable && msg.pairToken) {
           try {
@@ -217,39 +289,64 @@ export function startServer(opts: ServerOpts) {
           msg.discoverable ? (msg.pairToken || "") : "",
           msg.discoverable ? expiresAt : 0,
           Date.now(),
-          session.id,
+          targetId,
         );
-        ws.send(JSON.stringify({ type: "discoverable_updated", discoverable: !!msg.discoverable }));
-        console.log(`[bluetooth] ${session.id} discoverable=${!!msg.discoverable} expiresAt=${expiresAt ? new Date(expiresAt).toISOString() : "none"}`);
+        ws.send(JSON.stringify({ type: "discoverable_updated", discoverable: !!msg.discoverable, agentId, userId }));
+        console.log(`[bluetooth] ${targetId} discoverable=${!!msg.discoverable} expiresAt=${expiresAt ? new Date(expiresAt).toISOString() : "none"}`);
       }
 
-      if (msg.type === "update_card" && session) {
+      if (msg.type === "update_card") {
         const card = msg.card || {};
+        // Resolve which agent to update
+        const agentId = msg.agentId;
+        const userId = msg.userId || "";
+        let targetId: string | undefined;
+        if (agentId) {
+          targetId = buildAgentId(conn.orgId, agentId, userId || undefined);
+        } else if (conn.agents.size === 1) {
+          targetId = conn.agents.keys().next().value;
+        }
+        if (!targetId || !conn.agents.has(targetId)) return;
+
+        const session = conn.agents.get(targetId)!;
         db.prepare("UPDATE agents SET display_name = ?, description = ?, card_json = ?, updated_at = ? WHERE id = ?").run(
           card.name || session.displayName,
           card.description || "",
           JSON.stringify(card),
           Date.now(),
-          session.id,
+          targetId,
         );
         session.displayName = card.name || session.displayName;
         session.description = card.description || "";
         session.cardJson = JSON.stringify(card);
-        ws.send(JSON.stringify({ type: "card_updated" }));
-        console.log(`[bluetooth] ${session.id} card updated: ${card.name}`);
+        ws.send(JSON.stringify({ type: "card_updated", agentId, userId }));
+        console.log(`[bluetooth] ${targetId} card updated: ${card.name}`);
       }
 
       if (msg.type === "ping") {
         ws.send('{"type":"pong"}');
-        if (session) setAgentOnline(db, session.id);
+        for (const session of conn.agents.values()) {
+          setAgentOnline(db, session.id);
+        }
       }
     });
 
     ws.on("close", () => {
-      if (session) { sessions.delete(session.id); setAgentOffline(db, session.id); console.log(`[bluetooth] agent disconnected: ${session.id}`); }
+      for (const [id, session] of conn.agents) {
+        sessions.delete(id);
+        setAgentOffline(db, id);
+      }
+      if (conn.agents.size > 0) {
+        console.log(`[bluetooth] ws disconnected: ${conn.agents.size} agent(s) from ${conn.orgId} went offline`);
+      }
+      conn.agents.clear();
     });
     ws.on("error", () => {
-      if (session) { sessions.delete(session.id); setAgentOffline(db, session.id); }
+      for (const [id] of conn.agents) {
+        sessions.delete(id);
+        setAgentOffline(db, id);
+      }
+      conn.agents.clear();
     });
   });
 
@@ -291,8 +388,6 @@ export function startServer(opts: ServerOpts) {
     }
 
     // A2A proxy: /u/{orgId}/{agentId}/{userId?}/...
-    // Match with userId: /u/org/agent/user/subpath
-    // Match without userId: /u/org/agent/subpath
     const proxyMatch3 = url.match(/^\/u\/([^/]+)\/([^/]+)\/([^/]+)(\/.*)?$/);
     const proxyMatch2 = url.match(/^\/u\/([^/]+)\/([^/]+)(\/.*)?$/);
 
@@ -300,15 +395,11 @@ export function startServer(opts: ServerOpts) {
       let pOrgId: string, pAgentId: string, pUserId: string, subPath: string;
 
       if (proxyMatch3) {
-        // Could be /u/org/agent/userId/path or /u/org/agent/path
-        // Check if segment 3 is a userId (has a session) or a subpath
         const [, o, a, seg3, seg4] = proxyMatch3;
         const withUserId = buildAgentId(o, a, seg3);
         if (sessions.has(withUserId) || getAgentById(db, withUserId)) {
-          // It's a userId
           pOrgId = o; pAgentId = a; pUserId = seg3; subPath = seg4 || "/";
         } else {
-          // It's a subpath, no userId
           pOrgId = o; pAgentId = a; pUserId = ""; subPath = `/${seg3}${seg4 || ""}`;
         }
       } else {
@@ -319,7 +410,6 @@ export function startServer(opts: ServerOpts) {
       const id = buildAgentId(pOrgId, pAgentId, pUserId || undefined);
       const targetSession = sessions.get(id);
       if (!targetSession || targetSession.ws.readyState !== WebSocket.OPEN) {
-        // Fallback: try without userId for backward compat
         const fallbackId = buildAgentId(pOrgId, pAgentId);
         const fallbackSession = pUserId ? sessions.get(fallbackId) : null;
         if (fallbackSession && fallbackSession.ws.readyState === WebSocket.OPEN) {
