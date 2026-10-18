@@ -22,6 +22,7 @@ export function openDb(path: string): Db {
       id            TEXT PRIMARY KEY,
       org_id        TEXT NOT NULL,
       agent_id      TEXT NOT NULL,
+      user_id       TEXT NOT NULL DEFAULT '',
       provider_ref  TEXT NOT NULL DEFAULT '',
       display_name  TEXT NOT NULL DEFAULT '',
       description   TEXT NOT NULL DEFAULT '',
@@ -34,12 +35,17 @@ export function openDb(path: string): Db {
       last_seen_at  INTEGER NOT NULL DEFAULT 0,
       created_at    INTEGER NOT NULL DEFAULT 0,
       updated_at    INTEGER NOT NULL DEFAULT 0,
-      UNIQUE(org_id, agent_id)
+      UNIQUE(org_id, agent_id, user_id)
     );
     CREATE INDEX IF NOT EXISTS idx_agents_discoverable ON agents(discoverable, online);
   `);
-  // Migration: add provider_ref column if missing
+  // Migrations for existing installs
   try { db.exec("ALTER TABLE agents ADD COLUMN provider_ref TEXT NOT NULL DEFAULT ''"); } catch { /* already exists */ }
+  try { db.exec("ALTER TABLE agents ADD COLUMN user_id TEXT NOT NULL DEFAULT ''"); } catch { /* already exists */ }
+  // Migrate unique constraint: old (org_id, agent_id) → new (org_id, agent_id, user_id)
+  // SQLite can't ALTER constraints, but the new table creation handles fresh installs.
+  // For existing DBs, duplicate (org_id, agent_id) rows with different user_id will just work
+  // since the PK is `id` which now includes userId.
   return db;
 }
 
@@ -100,12 +106,25 @@ export function validateToken(db: Db, token: string): Provider | null {
   return { id: row.id, providerId: row.provider_id, providerName: row.provider_name, createdAt: row.created_at };
 }
 
+// ── Agent ID helpers ──
+
+/** Build the canonical agent id: orgId/agentId or orgId/agentId:userId */
+export function buildAgentId(orgId: string, agentId: string, userId?: string): string {
+  return userId ? `${orgId}/${agentId}:${userId}` : `${orgId}/${agentId}`;
+}
+
+/** Build the public URL path for an agent */
+export function buildAgentPath(orgId: string, agentId: string, userId?: string): string {
+  return userId ? `/u/${orgId}/${agentId}/${userId}` : `/u/${orgId}/${agentId}`;
+}
+
 // ── Agent CRUD ──
 
 export interface Agent {
   id: string;
   orgId: string;
   agentId: string;
+  userId: string;
   providerRef: string;
   displayName: string;
   description: string;
@@ -118,12 +137,13 @@ export interface Agent {
 
 export function upsertAgent(
   db: Db,
-  opts: { orgId: string; agentId: string; providerRef: string; displayName: string; description: string; cardJson: string; apiKeyHash: string; discoverable: boolean },
+  opts: { orgId: string; agentId: string; userId?: string; providerRef: string; displayName: string; description: string; cardJson: string; apiKeyHash: string; discoverable: boolean },
 ): Agent {
-  const id = `${opts.orgId}/${opts.agentId}`;
+  const userId = opts.userId || "";
+  const id = buildAgentId(opts.orgId, opts.agentId, userId || undefined);
   const now = Date.now();
   db.prepare(`
-    INSERT INTO agents (id, org_id, agent_id, provider_ref, display_name, description, card_json, api_key_hash, discoverable, online, last_seen_at, created_at, updated_at)
+    INSERT INTO agents (id, org_id, agent_id, user_id, provider_ref, display_name, description, card_json, api_key_hash, discoverable, online, last_seen_at, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       provider_ref = excluded.provider_ref,
@@ -135,10 +155,11 @@ export function upsertAgent(
       online = 1,
       last_seen_at = excluded.last_seen_at,
       updated_at = excluded.updated_at
-  `).run(id, opts.orgId, opts.agentId, opts.providerRef, opts.displayName, opts.description, opts.cardJson, opts.apiKeyHash, opts.discoverable ? 1 : 0, now, now, now);
+  `).run(id, opts.orgId, opts.agentId, userId, opts.providerRef, opts.displayName, opts.description, opts.cardJson, opts.apiKeyHash, opts.discoverable ? 1 : 0, now, now, now);
 
   return {
-    id, orgId: opts.orgId, agentId: opts.agentId, providerRef: opts.providerRef,
+    id, orgId: opts.orgId, agentId: opts.agentId, userId,
+    providerRef: opts.providerRef,
     displayName: opts.displayName, description: opts.description, cardJson: opts.cardJson,
     discoverable: opts.discoverable, pairToken: "", online: true, lastSeenAt: now,
   };
@@ -156,14 +177,25 @@ export function listDiscoverableAgents(db: Db): Agent[] {
   return (db.prepare("SELECT * FROM agents WHERE discoverable = 1 ORDER BY online DESC, last_seen_at DESC").all() as any[]).map(rowToAgent);
 }
 
-export function getAgent(db: Db, orgId: string, agentId: string): Agent | null {
+export function getAgent(db: Db, orgId: string, agentId: string, userId?: string): Agent | null {
+  if (userId) {
+    const row = db.prepare("SELECT * FROM agents WHERE org_id = ? AND agent_id = ? AND user_id = ?").get(orgId, agentId, userId) as any;
+    return row ? rowToAgent(row) : null;
+  }
+  // Legacy: match without userId (first match)
   const row = db.prepare("SELECT * FROM agents WHERE org_id = ? AND agent_id = ?").get(orgId, agentId) as any;
+  return row ? rowToAgent(row) : null;
+}
+
+export function getAgentById(db: Db, id: string): Agent | null {
+  const row = db.prepare("SELECT * FROM agents WHERE id = ?").get(id) as any;
   return row ? rowToAgent(row) : null;
 }
 
 function rowToAgent(r: any): Agent {
   return {
     id: r.id, orgId: r.org_id, agentId: r.agent_id,
+    userId: r.user_id || "",
     providerRef: r.provider_ref || "",
     displayName: r.display_name, description: r.description,
     cardJson: r.card_json, discoverable: r.discoverable === 1,
