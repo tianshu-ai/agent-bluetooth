@@ -144,7 +144,7 @@ export function upsertAgent(
   const now = Date.now();
   db.prepare(`
     INSERT INTO agents (id, org_id, agent_id, user_id, provider_ref, display_name, description, card_json, api_key_hash, discoverable, online, last_seen_at, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       provider_ref = excluded.provider_ref,
       display_name = excluded.display_name,
