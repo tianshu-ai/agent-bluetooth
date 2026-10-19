@@ -188,6 +188,7 @@ export function startServer(opts: ServerOpts) {
               fromOrgId: fromSession.orgId,
               fromAgentId: fromSession.agentId,
               fromUserId: fromSession.userId,
+              targetUserId: targetSession.userId,
               fromName: msg.name || fromSession.displayName,
               fromCard: msg.card,
               fromEndpoint: `${publicUrl}${fromPath}`,
